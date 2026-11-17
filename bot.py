@@ -31,8 +31,8 @@ os.makedirs(USERS_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-user_states = {}
-active_workers = {}
+user_states = {}       # user_id -> "wait_faq" | "wait_extra" | None
+active_workers = {}    # user_id -> {"stop": bool, "extra_event": threading.Event, "extra_count": int}
 login_locks = threading.Lock()
 
 
@@ -68,6 +68,9 @@ def save_accounts(user_id, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ==========================================
+# ПАРСЕР ТЗ
+# ==========================================
 def parse_faq_text(raw_text):
     direct_comment = None
     m = re.search(
@@ -146,6 +149,9 @@ def parse_faq_text(raw_text):
     return cfg
 
 
+# ==========================================
+# МЕНЮ TELEGRAM
+# ==========================================
 def main_menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -177,32 +183,63 @@ def cmd_start(message):
         "👋 **Панель управления TikTok-ботом**\n\n"
         "1. Во вкладке **«📱 Аккаунты»** добавь свой профиль TikTok по ссылке.\n"
         "2. Во вкладке **«📝 Задать / Обновить ТЗ»** отправь текст задания.\n"
-        "3. Нажми **«🚀 Запустить задание»** и выбери аккаунт.",
+        "3. Нажми **«🚀 Запустить задание»**, выбери аккаунт и формат отправки скринов.",
         parse_mode="Markdown",
         reply_markup=main_menu_kb(),
     )
 
 
+# ==========================================
+# ДОБАВЛЕНИЕ АККАУНТА ПО ССЫЛКЕ (noVNC + Cloudflared)
+# ==========================================
+def ensure_vnc_services():
+    """Проверяет, запущены ли Xvfb, x11vnc и websockify, и при необходимости поднимает их."""
+    try:
+        out = subprocess.check_output(["pgrep", "-f", "websockify"], text=True)
+        if out.strip():
+            return
+    except Exception:
+        pass
+
+    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1600x950x24"])
+    time.sleep(1.5)
+    subprocess.Popen(["x11vnc", "-display", ":99", "-forever", "-nopw", "-shared", "-rfbport", "5900"])
+    time.sleep(1.0)
+    subprocess.Popen(["websockify", "--web=/usr/share/novnc/", "6080", "localhost:5900"])
+    time.sleep(1.5)
+
+
 def start_cloudflared_tunnel():
+    ensure_vnc_services()
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", "[http://127.0.0.1:6080](http://127.0.0.1:6080)"],
+        ["cloudflared", "tunnel", "--protocol", "http2", "--url", "[http://127.0.0.1:6080](http://127.0.0.1:6080)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
-    url = None
+    url_holder = {"url": None}
+
+    def drain_output():
+        try:
+            for line in proc.stdout:
+                if not url_holder["url"]:
+                    m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", line)
+                    if m:
+                        url_holder["url"] = m.group(1)
+        except Exception:
+            pass
+
+    threading.Thread(target=drain_output, daemon=True).start()
+
     start_t = time.time()
     while time.time() - start_t < 25:
-        line = proc.stdout.readline()
-        if not line:
+        if url_holder["url"]:
+            time.sleep(4)
             break
-        m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", line)
-        if m:
-            url = m.group(1)
-            break
-    if url:
-        time.sleep(2.5)
-    return proc, url
+        time.sleep(0.5)
+
+    return proc, url_holder["url"]
 
 
 def login_session_worker(user_id, chat_id):
@@ -290,6 +327,9 @@ def login_session_worker(user_id, chat_id):
         login_locks.release()
 
 
+# ==========================================
+# РАБОЧИЙ ЦИКЛ КОММЕНТИНГА И ОТПРАВКА СКРИНОВ
+# ==========================================
 def apply_stealth(page):
     if HAS_STEALTH_CLASS:
         Stealth().apply_stealth_sync(page)
@@ -355,18 +395,53 @@ def click_any_reply_button(page, replied_comment_keys, keywords):
     return False
 
 
-def send_screens_archive(chat_id, save_dir, task_name):
-    zip_path = f"{save_dir}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname in sorted(os.listdir(save_dir)):
-            if fname.endswith(".jpg"):
+def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=1):
+    """Отправляет скриншоты либо ZIP-архивом, либо пачкой фотографий (альбомами по 10 штук)."""
+    all_files = sorted(
+        [f for f in os.listdir(save_dir) if f.endswith(".jpg")],
+        key=lambda x: int(re.search(r"(\d+)", x).group(1))
+    )
+    if not all_files:
+        return
+
+    if delivery_mode == "photos":
+        files_to_send = [
+            f for f in all_files
+            if int(re.search(r"(\d+)", f).group(1)) >= start_from_idx
+        ]
+        bot.send_message(chat_id, f"🖼 Отправляю {len(files_to_send)} скриншотов пачкой в чат...")
+        # Telegram разрешает до 10 фото в одном альбоме (send_media_group)
+        for i in range(0, len(files_to_send), 10):
+            chunk = files_to_send[i:i + 10]
+            media = []
+            opened_files = []
+            for idx, fname in enumerate(chunk):
+                f_obj = open(os.path.join(save_dir, fname), "rb")
+                opened_files.append(f_obj)
+                caption = f"📸 {task_name} ({i + 1}–{i + len(chunk)})" if idx == 0 else None
+                media.append(types.InputMediaPhoto(f_obj, caption=caption))
+            try:
+                bot.send_media_group(chat_id, media)
+            finally:
+                for f_obj in opened_files:
+                    f_obj.close()
+            time.sleep(1.5)
+    else:
+        zip_path = f"{save_dir}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in all_files:
                 zf.write(os.path.join(save_dir, fname), arcname=fname)
-    with open(zip_path, "rb") as f:
-        bot.send_document(chat_id, f, caption=f"📦 Готовые скриншоты по заданию **{task_name}**", parse_mode="Markdown")
-    os.remove(zip_path)
+        with open(zip_path, "rb") as f:
+            bot.send_document(
+                chat_id,
+                f,
+                caption=f"📦 Готовые скриншоты по заданию **{task_name}** ({len(all_files)} шт.)",
+                parse_mode="Markdown",
+            )
+        os.remove(zip_path)
 
 
-def task_worker(user_id, chat_id, acc_id):
+def task_worker(user_id, chat_id, acc_id, delivery_mode):
     paths = get_user_paths(user_id)
     accounts = load_accounts(user_id)
     acc_info = accounts.get(acc_id)
@@ -388,14 +463,17 @@ def task_worker(user_id, chat_id, acc_id):
     save_dir = os.path.join(paths["screens"], f"{task_name}_{int(time.time())}")
     os.makedirs(save_dir, exist_ok=True)
     total_screens = 0
+    last_sent_idx = 1
 
     state_ctrl = {"stop": False, "extra_event": threading.Event(), "extra_count": 0}
     active_workers[user_id] = state_ctrl
 
+    mode_label = "🖼 Пачкой фото в чат" if delivery_mode == "photos" else "📦 ZIP-архивом"
     bot.send_message(
         chat_id,
         f"🚀 Запустил задание **{task_name}** на аккаунте **{username}**\n"
         f"• Цель: {target_screens} скринов (макс {max_per_video}/ролик)\n"
+        f"• Выдача: {mode_label}\n"
         f"• Текст: `{base_comment}`",
         parse_mode="Markdown",
     )
@@ -495,7 +573,8 @@ def task_worker(user_id, chat_id, acc_id):
                 if state_ctrl["stop"]:
                     break
 
-                send_screens_archive(chat_id, save_dir, task_name)
+                send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=last_sent_idx)
+                last_sent_idx = total_screens + 1
 
                 kb = types.InlineKeyboardMarkup(row_width=1)
                 kb.add(
@@ -528,6 +607,9 @@ def task_worker(user_id, chat_id, acc_id):
         active_workers.pop(user_id, None)
 
 
+# ==========================================
+# ОБРАБОТКА КНОПОК И ТЕКСТА
+# ==========================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
@@ -559,7 +641,7 @@ def handle_callbacks(call):
             return
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(
-            types.InlineKeyboardButton("🚀 Запустить задание на этом аккаунте", callback_data=f"run_acc:{acc_id}"),
+            types.InlineKeyboardButton("🚀 Запустить задание на этом аккаунте", callback_data=f"choose_fmt:{acc_id}"),
             types.InlineKeyboardButton("🗑 Удалить аккаунт", callback_data=f"del_acc:{acc_id}"),
             types.InlineKeyboardButton("🔙 К списку аккаунтов", callback_data="menu_accounts"),
         )
@@ -598,11 +680,11 @@ def handle_callbacks(call):
             return
         kb = types.InlineKeyboardMarkup(row_width=1)
         for acc_id, info in accounts.items():
-            kb.add(types.InlineKeyboardButton(f"▶️ {info['username']}", callback_data=f"run_acc:{acc_id}"))
+            kb.add(types.InlineKeyboardButton(f"▶️ {info['username']}", callback_data=f"choose_fmt:{acc_id}"))
         kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="menu_main"))
         bot.edit_message_text("Выбери аккаунт для запуска задания:", chat_id, call.message.message_id, reply_markup=kb)
 
-    elif data.startswith("run_acc:"):
+    elif data.startswith("choose_fmt:"):
         acc_id = data.split(":", 1)[1]
         paths = get_user_paths(user_id)
         if not os.path.exists(paths["faq"]):
@@ -611,8 +693,27 @@ def handle_callbacks(call):
         if user_id in active_workers:
             bot.answer_callback_query(call.id, "У тебя уже запущено задание!", show_alert=True)
             return
-        bot.answer_callback_query(call.id, "Запускаю...")
-        threading.Thread(target=task_worker, args=(user_id, chat_id, acc_id), daemon=True).start()
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🖼 Пачкой фото сразу в чат", callback_data=f"start_task:{acc_id}:photos"),
+            types.InlineKeyboardButton("📦 Одним ZIP-архивом", callback_data=f"start_task:{acc_id}:zip"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="menu_run"),
+        )
+        bot.edit_message_text(
+            "📤 **Как отправить готовые скриншоты после выполнения?**",
+            chat_id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("start_task:"):
+        _, acc_id, delivery_mode = data.split(":", 2)
+        if user_id in active_workers:
+            bot.answer_callback_query(call.id, "У тебя уже запущено задание!", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Запускаю задание...")
+        threading.Thread(target=task_worker, args=(user_id, chat_id, acc_id, delivery_mode), daemon=True).start()
 
     elif data == "task_extra":
         user_states[user_id] = "wait_extra"
