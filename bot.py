@@ -45,6 +45,33 @@ user_states = {}       # user_id -> "wait_faq" | "wait_extra" | None
 active_workers = {}    # user_id -> {"stop": bool, "extra_event": Event, "extra_count": int}
 login_locks = threading.Lock()
 
+BTN_PAUSE = "⏸ Пауза"
+BTN_RESUME = "▶️ Продолжить"
+BTN_STOP = "🛑 Завершить задание"
+BTN_MENU = "🏠 Меню"
+
+
+def bottom_kb():
+    """Постоянное меню внизу чата."""
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.row(types.KeyboardButton(BTN_PAUSE), types.KeyboardButton(BTN_RESUME))
+    kb.row(types.KeyboardButton(BTN_STOP), types.KeyboardButton(BTN_MENU))
+    return kb
+
+
+def wait_if_paused(ctrl):
+    """Блокируется, пока задание на паузе. Прерывается при остановке."""
+    while not ctrl["pause"].is_set() and not ctrl["stop"]:
+        time.sleep(0.5)
+
+
+def isleep(ctrl, seconds):
+    """Сон, который реагирует на паузу и остановку."""
+    end = time.time() + seconds
+    while time.time() < end and not ctrl["stop"]:
+        wait_if_paused(ctrl)
+        time.sleep(min(0.5, max(0.0, end - time.time())))
+
 
 def get_user_paths(user_id):
     base = os.path.join(USERS_DIR, str(user_id))
@@ -208,6 +235,7 @@ def cmd_start(message):
         parse_mode="Markdown",
         reply_markup=main_menu_kb(),
     )
+    bot.send_message(message.chat.id, "⬇️ Кнопки управления заданием включены внизу.", reply_markup=bottom_kb())
 
 
 # ==========================================
@@ -607,29 +635,14 @@ def _send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from
         ]
         if not files_to_send:
             return
-        bot.send_message(chat_id, f"🖼 Отправляю {len(files_to_send)} скриншотов пачкой в чат...")
-        for i in range(0, len(files_to_send), 5):
-            chunk = files_to_send[i:i + 5]
+        # По одному скрину, без подписи
+        for fname in files_to_send:
+            def _send_one(fname=fname):
+                with open(os.path.join(save_dir, fname), "rb") as f_obj:
+                    bot.send_photo(chat_id, f_obj, timeout=120)
 
-            def _send_chunk(chunk=chunk, i=i):
-                media = []
-                opened_files = []
-                try:
-                    for idx, fname in enumerate(chunk):
-                        f_obj = open(os.path.join(save_dir, fname), "rb")
-                        opened_files.append(f_obj)
-                        caption = f"📸 {task_name} ({i + 1}–{i + len(chunk)})" if idx == 0 else None
-                        media.append(types.InputMediaPhoto(f_obj, caption=caption))
-                    if len(media) == 1:
-                        bot.send_photo(chat_id, opened_files[0], caption=media[0].caption, timeout=180)
-                    else:
-                        bot.send_media_group(chat_id, media, timeout=180)
-                finally:
-                    for f_obj in opened_files:
-                        f_obj.close()
-
-            with_retries(_send_chunk)
-            time.sleep(2)
+            with_retries(_send_one)
+            time.sleep(0.7)
     else:
         send_zip(chat_id, save_dir, task_name, all_files)
 
@@ -662,7 +675,8 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
     total_screens = 0
     last_sent_idx = 1
 
-    state_ctrl = {"stop": False, "extra_event": threading.Event(), "extra_count": 0}
+    state_ctrl = {"stop": False, "extra_event": threading.Event(), "extra_count": 0, "pause": threading.Event()}
+    state_ctrl["pause"].set()  # set = работает, clear = пауза
     active_workers[user_id] = state_ctrl
 
     mode_label = "🖼 Пачкой фото в чат" if delivery_mode == "photos" else "📦 ZIP-архивом"
@@ -673,6 +687,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
         f"• Выдача: {mode_label}\n"
         f"• Текст: `{base_comment}`",
         parse_mode="Markdown",
+        reply_markup=bottom_kb(),
     )
 
     try:
@@ -721,6 +736,9 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
 
             while not state_ctrl["stop"]:
                 while total_screens < target_screens and not state_ctrl["stop"]:
+                    wait_if_paused(state_ctrl)
+                    if state_ctrl["stop"]:
+                        break
                     video_start = time.time()
                     try:
                         check_and_solve_captcha(page, solver)
@@ -729,6 +747,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                         replied_keys = set()
 
                         for _ in range(max_per_video):
+                            wait_if_paused(state_ctrl)
                             if total_screens >= target_screens or state_ctrl["stop"]:
                                 break
 
@@ -759,7 +778,9 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                             break
 
                         wait_time = max(1.0, random.uniform(13.0, 15.0) - (time.time() - video_start))
-                        time.sleep(wait_time)
+                        isleep(state_ctrl, wait_time)
+                        if state_ctrl["stop"]:
+                            break
                         page.keyboard.press("ArrowDown")
                         time.sleep(2.2)
                     except Exception:
@@ -801,6 +822,11 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                     time.sleep(2.5)
                 else:
                     break
+
+            # Остановили вручную: отправляем то, что успели сделать
+            if state_ctrl["stop"] and total_screens >= last_sent_idx:
+                send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=last_sent_idx)
+                last_sent_idx = total_screens + 1
 
             context.close()
     except Exception as e:
@@ -938,6 +964,7 @@ def handle_callbacks(call):
         if worker:
             worker["stop"] = True
             worker["extra_count"] = 0
+            worker["pause"].set()
             worker["extra_event"].set()
         bot.send_message(chat_id, "👋 Работа завершена!", reply_markup=main_menu_kb())
 
@@ -976,6 +1003,29 @@ def handle_text(message):
     chat_id = message.chat.id
     state = user_states.get(user_id)
     text = (message.text or "").strip()
+
+    # Кнопки нижнего меню
+    if text in (BTN_PAUSE, BTN_RESUME, BTN_STOP, BTN_MENU):
+        worker = active_workers.get(user_id)
+        if text == BTN_MENU:
+            user_states[user_id] = None
+            bot.send_message(chat_id, "🏠 Главное меню:", reply_markup=main_menu_kb())
+        elif not worker:
+            bot.send_message(chat_id, "Сейчас нет активного задания.", reply_markup=bottom_kb())
+        elif text == BTN_PAUSE:
+            worker["pause"].clear()
+            bot.send_message(chat_id, "⏸ Пауза. Бот остановится после текущего действия. Нажми «▶️ Продолжить», чтобы продолжить.")
+        elif text == BTN_RESUME:
+            worker["pause"].set()
+            bot.send_message(chat_id, "▶️ Продолжаю работу.")
+        elif text == BTN_STOP:
+            worker["stop"] = True
+            worker["extra_count"] = 0
+            worker["pause"].set()
+            worker["extra_event"].set()
+            user_states[user_id] = None
+            bot.send_message(chat_id, "🛑 Завершаю задание. Отправлю скрины, которые уже сделаны.")
+        return
 
     if state == "wait_faq":
         try:
