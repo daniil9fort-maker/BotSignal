@@ -319,6 +319,12 @@ def start_cloudflared_tunnel():
 
 def detect_username(page, context):
     """Возвращает @username, если вход выполнен, иначе None."""
+    username, _ = detect_login(page, context)
+    return username
+
+
+def detect_login(page, context):
+    """Возвращает (username_или_None, has_session). has_session=True значит вход выполнен."""
     cookies = {c["name"] for c in context.cookies()}
     has_session = "sessionid" in cookies or "sessionid_ss" in cookies
 
@@ -327,20 +333,45 @@ def detect_username(page, context):
         if link.is_visible():
             m = re.search(r"/@([a-zA-Z0-9_.]+)", link.get_attribute("href") or "")
             if m:
-                return f"@{m.group(1)}"
+                return f"@{m.group(1)}", True
     except Exception:
         pass
 
     if has_session:
+        # 1) редирект /profile -> /@ник
         try:
             page.goto(f"https://{TIKTOK_HOST}/profile", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
+            try:
+                page.wait_for_url(re.compile(r".*/@[^/?]+.*"), timeout=10000)
+            except Exception:
+                pass
             m = re.search(r"/@([a-zA-Z0-9_.]+)", page.url)
             if m:
-                return f"@{m.group(1)}"
+                return f"@{m.group(1)}", True
         except Exception:
             pass
-    return None
+
+        # 2) ник из данных страницы
+        try:
+            html = page.content()
+            m = re.search(r'"uniqueId"\s*:\s*"([a-zA-Z0-9_.]+)"', html)
+            if m:
+                return f"@{m.group(1)}", True
+        except Exception:
+            pass
+
+        # 3) ссылка на профиль в меню
+        try:
+            href = page.locator('[data-e2e="profile-icon"]').first.evaluate(
+                "e => (e.closest('a') || e.querySelector('a') || {}).href || ''"
+            )
+            m = re.search(r"/@([a-zA-Z0-9_.]+)", href or "")
+            if m:
+                return f"@{m.group(1)}", True
+        except Exception:
+            pass
+
+    return None, has_session
 
 
 def login_session_worker(user_id, chat_id):
@@ -368,7 +399,7 @@ def login_session_worker(user_id, chat_id):
             chat_id,
             f"🔗 Перейди по ссылке ниже, чтобы войти в свой TikTok:\n\n"
             f"{vnc_link}\n\n"
-            f"⏳ У тебя есть 3 минуты, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм.\n\n"
+            f"⏳ У тебя есть 5 минут, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм.\n\n"
             f"ℹ️ Если пишет «DNS_PROBE_FINISHED_NXDOMAIN»: подожди 30 секунд и обнови страницу, "
             f"либо смени DNS на 1.1.1.1 / включи VPN."
         )
@@ -387,12 +418,20 @@ def login_session_worker(user_id, chat_id):
             page.goto(f"https://{TIKTOK_HOST}/login", wait_until="domcontentloaded", timeout=60000)
 
             username = None
-            deadline = time.time() + 180
+            session_hits = 0
+            deadline = time.time() + 300
             while time.time() < deadline:
                 time.sleep(3)
-                username = detect_username(page, context)
-                if username:
+                name, has_session = detect_login(page, context)
+                if name:
+                    username = name
                     break
+                if has_session:
+                    session_hits += 1
+                    # вход есть, но ник определить не удалось: сохраняем с запасным именем
+                    if session_hits >= 3:
+                        username = f"TikTok #{len(accounts) + 1}"
+                        break
 
             if username:
                 time.sleep(3)  # даём браузеру записать cookies в профиль
