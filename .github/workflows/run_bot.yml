@@ -1,0 +1,72 @@
+name: TikTok Bot 24/7 Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */3 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 185
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore user sessions and tasks
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: users-data
+          path: users
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies (Xvfb, VNC, noVNC, Cloudflared)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11vnc novnc websockify wget unzip
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Install Python dependencies & Playwright Chromium
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Start Virtual Display & VNC Server
+        run: |
+          Xvfb :99 -screen 0 1600x950x24 &
+          sleep 2
+          x11vnc -display :99 -forever -nopw -shared -rfbport 5900 &
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+
+      - name: Run Telegram Bot (for 2h 55m)
+        env:
+          DISPLAY: :99
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: |
+          timeout 10500 python bot.py || true
+
+      - name: Save user sessions and tasks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: users-data
+          path: users
+          retention-days: 5
+
+      - name: Trigger next workflow cycle
+        if: always()
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/run_bot.yml/dispatches \
+            -d '{"ref":"main"}'
