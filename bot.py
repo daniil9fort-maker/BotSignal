@@ -31,9 +31,8 @@ os.makedirs(USERS_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Состояния пользователей в памяти
-user_states = {}       # user_id -> "wait_faq" | "wait_extra" | None
-active_workers = {}    # user_id -> {"stop": bool, "extra_event": threading.Event, "extra_count": int}
+user_states = {}
+active_workers = {}
 login_locks = threading.Lock()
 
 
@@ -69,9 +68,6 @@ def save_accounts(user_id, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ==========================================
-# ПАРСЕР ТЗ
-# ==========================================
 def parse_faq_text(raw_text):
     direct_comment = None
     m = re.search(
@@ -150,9 +146,6 @@ def parse_faq_text(raw_text):
     return cfg
 
 
-# ==========================================
-# МЕНЮ TELEGRAM
-# ==========================================
 def main_menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -190,19 +183,16 @@ def cmd_start(message):
     )
 
 
-# ==========================================
-# ДОБАВЛЕНИЕ АККАУНТА ПО ССЫЛКЕ (noVNC + Cloudflared)
-# ==========================================
 def start_cloudflared_tunnel():
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", "http://localhost:6080"],
+        ["cloudflared", "tunnel", "--url", "[http://127.0.0.1:6080](http://127.0.0.1:6080)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     url = None
     start_t = time.time()
-    while time.time() - start_t < 20:
+    while time.time() - start_t < 25:
         line = proc.stdout.readline()
         if not line:
             break
@@ -210,6 +200,8 @@ def start_cloudflared_tunnel():
         if m:
             url = m.group(1)
             break
+    if url:
+        time.sleep(2.5)
     return proc, url
 
 
@@ -234,10 +226,9 @@ def login_session_worker(user_id, chat_id):
         vnc_link = f"{public_url}/vnc.html?autoconnect=true&resize=scale"
         bot.send_message(
             chat_id,
-            f"🔗 **Перейди по ссылке ниже, чтобы войти в свой TikTok:**\n\n"
+            f"🔗 Перейди по ссылке ниже, чтобы войти в свой TikTok:\n\n"
             f"{vnc_link}\n\n"
-            f"⏳ У тебя есть **3 минуты**, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм.",
-            parse_mode="Markdown",
+            f"⏳ У тебя есть 3 минуты, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм."
         )
 
         with sync_playwright() as p:
@@ -251,7 +242,8 @@ def login_session_worker(user_id, chat_id):
             if HAS_STEALTH_CLASS:
                 Stealth().apply_stealth_sync(page)
 
-            page.goto("[https://www.tiktok.com/login](https://www.tiktok.com/login)", wait_until="domcontentloaded", timeout=60000)
+            tiktok_host = "www" + ".tiktok" + ".com"
+            page.goto(f"https://{tiktok_host}/login", wait_until="domcontentloaded", timeout=60000)
 
             logged_in = False
             username = None
@@ -260,7 +252,6 @@ def login_session_worker(user_id, chat_id):
             while time.time() < deadline:
                 time.sleep(3)
                 try:
-                    # Проверяем, исчезла ли кнопка входа и появился ли профиль
                     profile_link = page.locator('a[href^="/@"]').first
                     if profile_link.is_visible():
                         href = profile_link.get_attribute("href") or ""
@@ -292,16 +283,13 @@ def login_session_worker(user_id, chat_id):
 
             context.close()
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Ошибка при входе: {str(e)[:150]}")
+        bot.send_message(chat_id, f"❌ Ошибка при входе: {str(e)[:200]}")
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
         login_locks.release()
 
 
-# ==========================================
-# РАБОЧИЙ ЦИКЛ КОММЕНТИНГА
-# ==========================================
 def apply_stealth(page):
     if HAS_STEALTH_CLASS:
         Stealth().apply_stealth_sync(page)
@@ -392,7 +380,6 @@ def task_worker(user_id, chat_id, acc_id):
     task_name = cfg["task_name"]
     target_screens = cfg["target_screens"]
     max_per_video = cfg["max_per_video"]
-    need_like = cfg["need_like"]
     base_comment = cfg["comment_text"]
     keywords = cfg["keywords"]
     username = acc_info["username"]
@@ -425,7 +412,8 @@ def task_worker(user_id, chat_id, acc_id):
             apply_stealth(page)
             solver = PlaywrightSolver(page, SADCAPTCHA_API_KEY)
 
-            page.goto("[https://www.tiktok.com/](https://www.tiktok.com/)", wait_until="domcontentloaded", timeout=60000)
+            tiktok_host = "www" + ".tiktok" + ".com"
+            page.goto(f"https://{tiktok_host}/", wait_until="domcontentloaded", timeout=60000)
             time.sleep(5)
             check_and_solve_captcha(page, solver)
 
@@ -436,7 +424,7 @@ def task_worker(user_id, chat_id, acc_id):
                 page.keyboard.type(f"#{tag}", delay=60)
                 page.keyboard.press("Enter")
             else:
-                page.goto(f"[https://www.tiktok.com/search/video?q=%23](https://www.tiktok.com/search/video?q=%23){tag}", wait_until="domcontentloaded", timeout=60000)
+                page.goto(f"https://{tiktok_host}/search/video?q=%23{tag}", wait_until="domcontentloaded", timeout=60000)
 
             time.sleep(4)
             check_and_solve_captcha(page, solver)
@@ -540,9 +528,6 @@ def task_worker(user_id, chat_id, acc_id):
         active_workers.pop(user_id, None)
 
 
-# ==========================================
-# ОБРАБОТКА КНОПОК И ТЕКСТА
-# ==========================================
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     user_id = call.from_user.id
