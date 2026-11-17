@@ -6,6 +6,7 @@ import shutil
 import random
 import socket
 import zipfile
+import urllib.request
 import threading
 import subprocess
 import telebot
@@ -257,8 +258,22 @@ def ensure_vnc_services():
         raise RuntimeError("noVNC (порт 6080) не запустился. Проверь установку Xvfb, x11vnc, websockify, novnc.")
 
 
+def wait_url_ready(url, timeout=45):
+    """Ждёт, пока публичная ссылка реально начнёт отдавать noVNC (DNS + туннель)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(url + "/vnc.html", timeout=6) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
 def start_cloudflared_tunnel():
-    """Возвращает (process, public_url). Ссылка отдаётся только когда туннель реально подключён."""
+    """Возвращает (process, public_url). Ссылка отдаётся только когда туннель реально подключён и отвечает."""
     ensure_vnc_services()
     proc = subprocess.Popen(
         ["cloudflared", "tunnel", "--no-autoupdate", "--protocol", "http2",
@@ -287,7 +302,9 @@ def start_cloudflared_tunnel():
     start_t = time.time()
     while time.time() - start_t < 45:
         if state["url"] and state["connected"]:
-            time.sleep(2)  # запас на прогрев DNS
+            ready = wait_url_ready(state["url"], timeout=45)
+            if ready:
+                time.sleep(15)  # запас: DNS на стороне пользователя обновляется не мгновенно
             return proc, state["url"]
         if proc.poll() is not None:
             break
@@ -351,7 +368,9 @@ def login_session_worker(user_id, chat_id):
             chat_id,
             f"🔗 Перейди по ссылке ниже, чтобы войти в свой TikTok:\n\n"
             f"{vnc_link}\n\n"
-            f"⏳ У тебя есть 3 минуты, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм."
+            f"⏳ У тебя есть 3 минуты, чтобы авторизоваться. Как только войдёшь, бот сам сохранит аккаунт и покажет твой никнейм.\n\n"
+            f"ℹ️ Если пишет «DNS_PROBE_FINISHED_NXDOMAIN»: подожди 30 секунд и обнови страницу, "
+            f"либо смени DNS на 1.1.1.1 / включи VPN."
         )
 
         with sync_playwright() as p:
