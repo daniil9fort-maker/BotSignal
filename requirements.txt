@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+playwright
+playwright-stealth
+tiktok-captcha-solver
+g4f
+requests
