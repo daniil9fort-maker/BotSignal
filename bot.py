@@ -532,7 +532,66 @@ def click_any_reply_button(page, replied_comment_keys, keywords):
     return False
 
 
+telebot.apihelper.READ_TIMEOUT = 180
+telebot.apihelper.CONNECT_TIMEOUT = 30
+
+
+def with_retries(fn, attempts=4, delay=5):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            time.sleep(delay * (i + 1))
+    raise last
+
+
+def send_zip(chat_id, save_dir, task_name, all_files):
+    zip_path = f"{save_dir}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fname in all_files:
+            zf.write(os.path.join(save_dir, fname), arcname=fname)
+
+    def _send():
+        with open(zip_path, "rb") as f:
+            bot.send_document(
+                chat_id, f,
+                caption=f"📦 Скриншоты по заданию {task_name} ({len(all_files)} шт.)",
+                timeout=300,
+            )
+    try:
+        with_retries(_send)
+    finally:
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+
+
 def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=1):
+    """Безопасная обёртка: при сбое фото-режима падает на ZIP, ошибки не роняют задание."""
+    try:
+        _send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx)
+    except Exception as e:
+        try:
+            bot.send_message(chat_id, f"⚠️ Не удалось отправить скрины ({str(e)[:100]}). Пробую ZIP-архивом...")
+            all_files = sorted(
+                [f for f in os.listdir(save_dir) if f.endswith(".jpg")],
+                key=lambda x: int(re.search(r"(\d+)", x).group(1)),
+            )
+            send_zip(chat_id, save_dir, task_name, all_files)
+        except Exception as e2:
+            try:
+                bot.send_message(
+                    chat_id,
+                    f"❌ Отправка не удалась: {str(e2)[:100]}\nСкрины сохранены. Напиши боту /screens, чтобы получить их позже.",
+                )
+            except Exception:
+                pass
+
+
+def _send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=1):
     """Отправляет скриншоты либо ZIP-архивом, либо пачкой фотографий (альбомами по 10 штук)."""
     all_files = sorted(
         [f for f in os.listdir(save_dir) if f.endswith(".jpg")],
@@ -549,37 +608,30 @@ def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_
         if not files_to_send:
             return
         bot.send_message(chat_id, f"🖼 Отправляю {len(files_to_send)} скриншотов пачкой в чат...")
-        for i in range(0, len(files_to_send), 10):
-            chunk = files_to_send[i:i + 10]
-            media = []
-            opened_files = []
-            for idx, fname in enumerate(chunk):
-                f_obj = open(os.path.join(save_dir, fname), "rb")
-                opened_files.append(f_obj)
-                caption = f"📸 {task_name} ({i + 1}–{i + len(chunk)})" if idx == 0 else None
-                media.append(types.InputMediaPhoto(f_obj, caption=caption))
-            try:
-                if len(media) == 1:
-                    opened_files[0].seek(0)
-                    bot.send_photo(chat_id, opened_files[0], caption=media[0].caption)
-                else:
-                    bot.send_media_group(chat_id, media)
-            finally:
-                for f_obj in opened_files:
-                    f_obj.close()
-            time.sleep(1.5)
+        for i in range(0, len(files_to_send), 5):
+            chunk = files_to_send[i:i + 5]
+
+            def _send_chunk(chunk=chunk, i=i):
+                media = []
+                opened_files = []
+                try:
+                    for idx, fname in enumerate(chunk):
+                        f_obj = open(os.path.join(save_dir, fname), "rb")
+                        opened_files.append(f_obj)
+                        caption = f"📸 {task_name} ({i + 1}–{i + len(chunk)})" if idx == 0 else None
+                        media.append(types.InputMediaPhoto(f_obj, caption=caption))
+                    if len(media) == 1:
+                        bot.send_photo(chat_id, opened_files[0], caption=media[0].caption, timeout=180)
+                    else:
+                        bot.send_media_group(chat_id, media, timeout=180)
+                finally:
+                    for f_obj in opened_files:
+                        f_obj.close()
+
+            with_retries(_send_chunk)
+            time.sleep(2)
     else:
-        zip_path = f"{save_dir}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fname in all_files:
-                zf.write(os.path.join(save_dir, fname), arcname=fname)
-        with open(zip_path, "rb") as f:
-            bot.send_document(
-                chat_id,
-                f,
-                caption=f"📦 Готовые скриншоты по заданию {task_name} ({len(all_files)} шт.)",
-            )
-        os.remove(zip_path)
+        send_zip(chat_id, save_dir, task_name, all_files)
 
 
 def task_worker(user_id, chat_id, acc_id, delivery_mode):
@@ -888,6 +940,34 @@ def handle_callbacks(call):
             worker["extra_count"] = 0
             worker["extra_event"].set()
         bot.send_message(chat_id, "👋 Работа завершена!", reply_markup=main_menu_kb())
+
+
+@bot.message_handler(commands=["screens"])
+def cmd_screens(message):
+    """Отправляет ZIP со скринами последнего задания."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    screens_root = get_user_paths(user_id)["screens"]
+    dirs = [
+        os.path.join(screens_root, d) for d in os.listdir(screens_root)
+        if os.path.isdir(os.path.join(screens_root, d))
+    ]
+    if not dirs:
+        bot.send_message(chat_id, "Сохранённых скринов нет.")
+        return
+    latest = max(dirs, key=os.path.getmtime)
+    files = sorted(
+        [f for f in os.listdir(latest) if f.endswith(".jpg")],
+        key=lambda x: int(re.search(r"(\d+)", x).group(1)),
+    )
+    if not files:
+        bot.send_message(chat_id, "В последней папке нет скринов.")
+        return
+    bot.send_message(chat_id, f"📦 Отправляю {len(files)} скринов архивом...")
+    try:
+        send_zip(chat_id, latest, os.path.basename(latest), files)
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Не удалось отправить: {str(e)[:120]}")
 
 
 @bot.message_handler(func=lambda m: True)
