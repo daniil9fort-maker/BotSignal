@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '0 */3 * * *'
 
+permissions:
+  contents: write   # чтобы бот мог пушить скрины в репозиторий
+
 # Не даём запуститься двум копиям бота одновременно
 # (иначе Telegram выдаст ошибку 409: два бота с одним токеном)
 concurrency:
@@ -19,6 +22,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Восстанавливаем аккаунты/сессии из прошлого запуска.
       # (download-artifact тут не работает: он берёт файлы только из ТЕКУЩЕГО запуска)
@@ -65,3 +70,13 @@ jobs:
         with:
           path: users
           key: users-${{ github.run_id }}
+
+      # Скрины можно скачать на странице запуска (Actions -> запуск -> Artifacts)
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: users/*/screenshots
+          if-no-files-found: ignore
+          retention-days: 3
