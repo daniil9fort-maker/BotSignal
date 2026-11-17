@@ -4,6 +4,7 @@ import json
 import time
 import shutil
 import random
+import socket
 import zipfile
 import threading
 import subprocess
@@ -21,18 +22,26 @@ except ImportError:
     HAS_STEALTH_CLASS = False
 
 # ==========================================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (ключи берём из переменных окружения!)
+#   export BOT_TOKEN="новый_токен_от_BotFather"
+#   export SADCAPTCHA_API_KEY="новый_ключ"
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8992961605:AAFd1saFgcA5EMXwjl75DPyeJMB27SaviBM")
-SADCAPTCHA_API_KEY = os.getenv("SADCAPTCHA_API_KEY", "c3e866d07189caebcb8bc97e838ce290")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SADCAPTCHA_API_KEY = os.getenv("SADCAPTCHA_API_KEY", "").strip()
+if not BOT_TOKEN:
+    raise SystemExit("Не задан BOT_TOKEN. Выполни: export BOT_TOKEN='твой_токен'")
+
 USERS_DIR = os.path.join(os.getcwd(), "users")
 os.makedirs(USERS_DIR, exist_ok=True)
+
+TIKTOK_HOST = "www.tiktok.com"
+VNC_DISPLAY = ":99"
 # ==========================================
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 user_states = {}       # user_id -> "wait_faq" | "wait_extra" | None
-active_workers = {}    # user_id -> {"stop": bool, "extra_event": threading.Event, "extra_count": int}
+active_workers = {}    # user_id -> {"stop": bool, "extra_event": Event, "extra_count": int}
 login_locks = threading.Lock()
 
 
@@ -140,6 +149,17 @@ def parse_faq_text(raw_text):
             "keywords": list(set(bot_names)),
         }
 
+    # Защита от кривых значений из ИИ
+    cfg["task_name"] = re.sub(r'[\\/*?:"<>|]', "", str(cfg.get("task_name") or "Task_TT")).strip()[:40] or "Task_TT"
+    try:
+        cfg["target_screens"] = int(cfg.get("target_screens") or 20)
+    except Exception:
+        cfg["target_screens"] = 20
+    try:
+        cfg["max_per_video"] = int(cfg.get("max_per_video") or 4)
+    except Exception:
+        cfg["max_per_video"] = 4
+
     cfg["comment_text"] = direct_comment
     cfg["is_reply_mode"] = True
     if not cfg.get("hashtags"):
@@ -190,56 +210,120 @@ def cmd_start(message):
 
 
 # ==========================================
-# ДОБАВЛЕНИЕ АККАУНТА ПО ССЫЛКЕ (noVNC + Cloudflared)
+# ВИРТУАЛЬНЫЙ ЭКРАН + noVNC + CLOUDFLARED
 # ==========================================
-def ensure_vnc_services():
-    """Проверяет, запущены ли Xvfb, x11vnc и websockify, и при необходимости поднимает их."""
+def port_open(port, host="127.0.0.1"):
     try:
-        out = subprocess.check_output(["pgrep", "-f", "websockify"], text=True)
-        if out.strip():
-            return
-    except Exception:
-        pass
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
 
-    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1600x950x24"])
-    time.sleep(1.5)
-    subprocess.Popen(["x11vnc", "-display", ":99", "-forever", "-nopw", "-shared", "-rfbport", "5900"])
-    time.sleep(1.0)
-    subprocess.Popen(["websockify", "--web=/usr/share/novnc/", "6080", "localhost:5900"])
-    time.sleep(1.5)
+
+def find_novnc_dir():
+    for d in ("/usr/share/novnc", "/usr/share/novnc/", "/opt/novnc", "/usr/share/noVNC"):
+        if os.path.exists(os.path.join(d, "vnc.html")):
+            return d
+    return "/usr/share/novnc/"
+
+
+def ensure_vnc_services():
+    """Поднимает Xvfb, x11vnc и websockify, если они ещё не работают."""
+    # Chromium должен открываться именно на виртуальном экране
+    os.environ["DISPLAY"] = VNC_DISPLAY
+
+    if not os.path.exists("/tmp/.X11-unix/X99"):
+        subprocess.Popen(
+            ["Xvfb", VNC_DISPLAY, "-screen", "0", "1600x950x24"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.5)
+
+    if not port_open(5900):
+        subprocess.Popen(
+            ["x11vnc", "-display", VNC_DISPLAY, "-forever", "-nopw", "-shared", "-rfbport", "5900"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.5)
+
+    if not port_open(6080):
+        subprocess.Popen(
+            ["websockify", f"--web={find_novnc_dir()}", "6080", "localhost:5900"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.5)
+
+    if not port_open(6080):
+        raise RuntimeError("noVNC (порт 6080) не запустился. Проверь установку Xvfb, x11vnc, websockify, novnc.")
 
 
 def start_cloudflared_tunnel():
+    """Возвращает (process, public_url). Ссылка отдаётся только когда туннель реально подключён."""
     ensure_vnc_services()
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--protocol", "http2", "--url", "[http://127.0.0.1:6080](http://127.0.0.1:6080)"],
+        ["cloudflared", "tunnel", "--no-autoupdate", "--protocol", "http2",
+         "--url", "http://127.0.0.1:6080"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
-    url_holder = {"url": None}
+    state = {"url": None, "connected": False}
 
     def drain_output():
         try:
             for line in proc.stdout:
-                if not url_holder["url"]:
+                if not state["url"]:
                     m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", line)
                     if m:
-                        url_holder["url"] = m.group(1)
+                        state["url"] = m.group(1)
+                if "Registered tunnel connection" in line:
+                    state["connected"] = True
         except Exception:
             pass
 
     threading.Thread(target=drain_output, daemon=True).start()
 
     start_t = time.time()
-    while time.time() - start_t < 25:
-        if url_holder["url"]:
-            time.sleep(4)
+    while time.time() - start_t < 45:
+        if state["url"] and state["connected"]:
+            time.sleep(2)  # запас на прогрев DNS
+            return proc, state["url"]
+        if proc.poll() is not None:
             break
         time.sleep(0.5)
 
-    return proc, url_holder["url"]
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    return proc, None
+
+
+def detect_username(page, context):
+    """Возвращает @username, если вход выполнен, иначе None."""
+    cookies = {c["name"] for c in context.cookies()}
+    has_session = "sessionid" in cookies or "sessionid_ss" in cookies
+
+    try:
+        link = page.locator('a[href^="/@"]').first
+        if link.is_visible():
+            m = re.search(r"/@([a-zA-Z0-9_.]+)", link.get_attribute("href") or "")
+            if m:
+                return f"@{m.group(1)}"
+    except Exception:
+        pass
+
+    if has_session:
+        try:
+            page.goto(f"https://{TIKTOK_HOST}/profile", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)
+            m = re.search(r"/@([a-zA-Z0-9_.]+)", page.url)
+            if m:
+                return f"@{m.group(1)}"
+        except Exception:
+            pass
+    return None
 
 
 def login_session_worker(user_id, chat_id):
@@ -255,12 +339,14 @@ def login_session_worker(user_id, chat_id):
         profile_path = os.path.join(paths["profiles"], acc_id)
         os.makedirs(profile_path, exist_ok=True)
 
+        bot.send_message(chat_id, "⏳ Поднимаю ссылку для входа, подожди 10–30 секунд...")
         tunnel_proc, public_url = start_cloudflared_tunnel()
         if not public_url:
+            shutil.rmtree(profile_path, ignore_errors=True)
             bot.send_message(chat_id, "❌ Не удалось поднять ссылку для входа. Попробуй ещё раз.")
             return
 
-        vnc_link = f"{public_url}/vnc.html?autoconnect=true&resize=scale"
+        vnc_link = f"{public_url}/vnc.html?autoconnect=true&resize=scale&reconnect=true"
         bot.send_message(
             chat_id,
             f"🔗 Перейди по ссылке ниже, чтобы войти в свой TikTok:\n\n"
@@ -279,31 +365,21 @@ def login_session_worker(user_id, chat_id):
             if HAS_STEALTH_CLASS:
                 Stealth().apply_stealth_sync(page)
 
-            tiktok_host = "www" + ".tiktok" + ".com"
-            page.goto(f"https://{tiktok_host}/login", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"https://{TIKTOK_HOST}/login", wait_until="domcontentloaded", timeout=60000)
 
-            logged_in = False
             username = None
             deadline = time.time() + 180
-
             while time.time() < deadline:
                 time.sleep(3)
-                try:
-                    profile_link = page.locator('a[href^="/@"]').first
-                    if profile_link.is_visible():
-                        href = profile_link.get_attribute("href") or ""
-                        m = re.search(r"/@([a-zA-Z0-9_.]+)", href)
-                        if m:
-                            username = f"@{m.group(1)}"
-                            logged_in = True
-                            break
-                except Exception:
-                    pass
+                username = detect_username(page, context)
+                if username:
+                    break
 
-            if logged_in and username:
-                time.sleep(3)
+            if username:
+                time.sleep(3)  # даём браузеру записать cookies в профиль
                 accounts[acc_id] = {"username": username, "path": profile_path}
                 save_accounts(user_id, accounts)
+                context.close()
                 bot.send_message(
                     chat_id,
                     f"✅ Аккаунт **{username}** успешно добавлен!",
@@ -311,19 +387,21 @@ def login_session_worker(user_id, chat_id):
                     reply_markup=accounts_menu_kb(user_id),
                 )
             else:
+                context.close()
                 shutil.rmtree(profile_path, ignore_errors=True)
                 bot.send_message(
                     chat_id,
                     "⏰ Время ожидания входа вышло. Нажми «➕ Добавить аккаунт», чтобы попробовать снова.",
                     reply_markup=accounts_menu_kb(user_id),
                 )
-
-            context.close()
     except Exception as e:
         bot.send_message(chat_id, f"❌ Ошибка при входе: {str(e)[:200]}")
     finally:
         if tunnel_proc:
-            tunnel_proc.terminate()
+            try:
+                tunnel_proc.terminate()
+            except Exception:
+                pass
         login_locks.release()
 
 
@@ -339,13 +417,14 @@ def apply_stealth(page):
 
 def check_and_solve_captcha(page, solver):
     for sel in ['#captcha-verify-image', '.captcha_verify_container', '[id*="captcha"]']:
-        if page.locator(sel).first.is_visible():
-            try:
+        try:
+            if page.locator(sel).first.is_visible():
                 if SADCAPTCHA_API_KEY:
                     solver.solve_captcha_if_present()
                     time.sleep(3)
-            except Exception:
-                pass
+                return
+        except Exception:
+            pass
 
 
 def make_unique_comment(base_text, index):
@@ -361,9 +440,9 @@ def click_any_reply_button(page, replied_comment_keys, keywords):
 
     for i in range(total):
         btn = reply_btns.nth(i)
-        if not btn.is_visible():
-            continue
         try:
+            if not btn.is_visible():
+                continue
             block = btn.locator('xpath=../..')
             block_text = block.inner_text().strip()
             block_lower = block_text.lower()
@@ -399,7 +478,7 @@ def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_
     """Отправляет скриншоты либо ZIP-архивом, либо пачкой фотографий (альбомами по 10 штук)."""
     all_files = sorted(
         [f for f in os.listdir(save_dir) if f.endswith(".jpg")],
-        key=lambda x: int(re.search(r"(\d+)", x).group(1))
+        key=lambda x: int(re.search(r"(\d+)", x).group(1)),
     )
     if not all_files:
         return
@@ -409,8 +488,9 @@ def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_
             f for f in all_files
             if int(re.search(r"(\d+)", f).group(1)) >= start_from_idx
         ]
+        if not files_to_send:
+            return
         bot.send_message(chat_id, f"🖼 Отправляю {len(files_to_send)} скриншотов пачкой в чат...")
-        # Telegram разрешает до 10 фото в одном альбоме (send_media_group)
         for i in range(0, len(files_to_send), 10):
             chunk = files_to_send[i:i + 10]
             media = []
@@ -421,7 +501,11 @@ def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_
                 caption = f"📸 {task_name} ({i + 1}–{i + len(chunk)})" if idx == 0 else None
                 media.append(types.InputMediaPhoto(f_obj, caption=caption))
             try:
-                bot.send_media_group(chat_id, media)
+                if len(media) == 1:
+                    opened_files[0].seek(0)
+                    bot.send_photo(chat_id, opened_files[0], caption=media[0].caption)
+                else:
+                    bot.send_media_group(chat_id, media)
             finally:
                 for f_obj in opened_files:
                     f_obj.close()
@@ -435,8 +519,7 @@ def send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_
             bot.send_document(
                 chat_id,
                 f,
-                caption=f"📦 Готовые скриншоты по заданию **{task_name}** ({len(all_files)} шт.)",
-                parse_mode="Markdown",
+                caption=f"📦 Готовые скриншоты по заданию {task_name} ({len(all_files)} шт.)",
             )
         os.remove(zip_path)
 
@@ -449,8 +532,12 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
         bot.send_message(chat_id, "❌ Аккаунт не найден.")
         return
 
-    with open(paths["faq"], "r", encoding="utf-8") as f:
-        cfg = parse_faq_text(f.read())
+    try:
+        with open(paths["faq"], "r", encoding="utf-8") as f:
+            cfg = parse_faq_text(f.read())
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Не удалось прочитать ТЗ: {str(e)[:150]}")
+        return
 
     task_name = cfg["task_name"]
     target_screens = cfg["target_screens"]
@@ -479,6 +566,8 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
     )
 
     try:
+        ensure_vnc_services()  # виртуальный экран нужен и для рабочего браузера
+
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=profile_path,
@@ -490,8 +579,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
             apply_stealth(page)
             solver = PlaywrightSolver(page, SADCAPTCHA_API_KEY)
 
-            tiktok_host = "www" + ".tiktok" + ".com"
-            page.goto(f"https://{tiktok_host}/", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"https://{TIKTOK_HOST}/", wait_until="domcontentloaded", timeout=60000)
             time.sleep(5)
             check_and_solve_captcha(page, solver)
 
@@ -502,7 +590,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                 page.keyboard.type(f"#{tag}", delay=60)
                 page.keyboard.press("Enter")
             else:
-                page.goto(f"https://{tiktok_host}/search/video?q=%23{tag}", wait_until="domcontentloaded", timeout=60000)
+                page.goto(f"https://{TIKTOK_HOST}/search/video?q=%23{tag}", wait_until="domcontentloaded", timeout=60000)
 
             time.sleep(4)
             check_and_solve_captcha(page, solver)
@@ -528,7 +616,6 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                         check_and_solve_captcha(page, solver)
                         time.sleep(1.5)
 
-                        replies_done = 0
                         replied_keys = set()
 
                         for _ in range(max_per_video):
@@ -551,7 +638,6 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                             page.keyboard.press("Enter")
                             time.sleep(2.5)
 
-                            replies_done += 1
                             total_screens += 1
                             filepath = os.path.join(save_dir, f"screen_{total_screens}.jpg")
                             page.screenshot(path=filepath, type="jpeg", quality=85, full_page=False)
@@ -568,7 +654,10 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                         time.sleep(2.2)
                     except Exception:
                         time.sleep(2)
-                        page.keyboard.press("ArrowDown")
+                        try:
+                            page.keyboard.press("ArrowDown")
+                        except Exception:
+                            pass
 
                 if state_ctrl["stop"]:
                     break
@@ -591,6 +680,9 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
 
                 state_ctrl["extra_event"].clear()
                 state_ctrl["extra_event"].wait()
+
+                if state_ctrl["stop"]:
+                    break
 
                 if state_ctrl["extra_count"] > 0:
                     target_screens += state_ctrl["extra_count"]
@@ -788,5 +880,9 @@ def handle_text(message):
 
 
 if __name__ == "__main__":
+    try:
+        ensure_vnc_services()
+    except Exception as e:
+        print(f"[!] Не удалось заранее поднять VNC: {e}")
     print("[🤖] Telegram-бот запущен и готов к работе...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
