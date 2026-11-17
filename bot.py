@@ -47,6 +47,46 @@ def md_escape(text):
     return re.sub(r"([_*`\[])", r"\\\1", str(text))
 
 
+# --- Публикация скринов в репозиторий (только внутри GitHub Actions) ---
+GIT_ENABLED = os.getenv("GITHUB_ACTIONS") == "true"
+_git_event = threading.Event()
+SCREENS_PATHSPEC = ":(glob)users/*/screenshots/**"
+
+
+def _git(*args):
+    r = subprocess.run(["git", *args], capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        print(f"[git {' '.join(args[:2])}] rc={r.returncode}: {(r.stderr or r.stdout).strip()[:300]}")
+    return r
+
+
+def git_push_loop():
+    """Фоновый поток: коммитит и пушит новые скрины в users/<id>/screenshots/, не тормозя бота."""
+    _git("config", "user.name", "botsignal")
+    _git("config", "user.email", "botsignal@users.noreply.github.com")
+    while True:
+        _git_event.wait()
+        _git_event.clear()
+        time.sleep(2)  # копим несколько скринов в один коммит
+        try:
+            _git("add", "--", SCREENS_PATHSPEC)
+            if _git("diff", "--cached", "--quiet").returncode == 0:
+                continue  # нечего коммитить
+            _git("commit", "-q", "-m", "📸 новые скрины")
+            for _ in range(4):
+                _git("pull", "--rebase", "--autostash", "-q", "origin", "HEAD")
+                if _git("push", "-q", "origin", "HEAD").returncode == 0:
+                    break
+                time.sleep(3)
+        except Exception as e:
+            print(f"[!] git push: {e}")
+
+
+def request_git_push():
+    if GIT_ENABLED:
+        _git_event.set()
+
+
 def _with_markdown_fallback(method):
     """Если Telegram не смог разобрать разметку — шлём то же сообщение без неё, а не падаем."""
     def wrapper(*args, **kwargs):
@@ -94,6 +134,28 @@ def isleep(ctrl, seconds):
     while time.time() < end and not ctrl["stop"]:
         wait_if_paused(ctrl)
         time.sleep(min(0.5, max(0.0, end - time.time())))
+
+
+def get_active(user_id):
+    """Возвращает активное задание; если его поток уже мёртв — чистит «зависшую» запись."""
+    w = active_workers.get(user_id)
+    th = w.get("thread") if w else None
+    if w and th is not None and not th.is_alive():
+        active_workers.pop(user_id, None)
+        return None
+    return w
+
+
+def already_running(chat_id, call):
+    bot.answer_callback_query(call.id, "У тебя уже запущено задание")
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🛑 Остановить текущее задание", callback_data="force_stop"))
+    bot.send_message(
+        chat_id,
+        "⚠️ Предыдущее задание ещё не закрыто (возможно, оно ждёт ответа про штрафные скрины "
+        "или ещё выполняется). Останови его, и можно запускать новое.",
+        reply_markup=kb,
+    )
 
 
 def get_user_paths(user_id):
@@ -693,13 +755,15 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
     username = acc_info["username"]
     profile_path = acc_info["path"]
 
-    save_dir = os.path.join(paths["screens"], f"{task_name}_{int(time.time())}")
+    safe_name = re.sub(r"[^\w\-]+", "_", task_name).strip("_")[:40] or "task"
+    save_dir = os.path.join(paths["screens"], f"{safe_name}_{int(time.time())}")
     os.makedirs(save_dir, exist_ok=True)
     total_screens = 0
     last_sent_idx = 1
 
     state_ctrl = {"stop": False, "extra_event": threading.Event(), "extra_count": 0, "pause": threading.Event()}
     state_ctrl["pause"].set()  # set = работает, clear = пауза
+    state_ctrl["thread"] = threading.current_thread()
     active_workers[user_id] = state_ctrl
 
     def send_partial():
@@ -731,15 +795,18 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                 return  # остальное уйдёт в конце задания
 
     mode_label = "🖼 Пачкой фото в чат" if delivery_mode == "photos" else "📦 ZIP-архивом"
-    bot.send_message(
-        chat_id,
-        f"🚀 Запустил задание **{md_escape(task_name)}** на аккаунте **{md_escape(username)}**\n"
-        f"• Цель: {target_screens} скринов (макс {max_per_video}/ролик)\n"
-        f"• Выдача: {mode_label}\n"
-        f"• Текст: `{str(base_comment).replace(chr(96), chr(39))}`",
-        parse_mode="Markdown",
-        reply_markup=bottom_kb(),
-    )
+    try:
+        bot.send_message(
+            chat_id,
+            f"🚀 Запустил задание **{md_escape(task_name)}** на аккаунте **{md_escape(username)}**\n"
+            f"• Цель: {target_screens} скринов (макс {max_per_video}/ролик)\n"
+            f"• Выдача: {mode_label}\n"
+            f"• Текст: `{str(base_comment).replace(chr(96), chr(39))}`",
+            parse_mode="Markdown",
+            reply_markup=bottom_kb(),
+        )
+    except Exception as e:
+        print(f"[!] Не удалось отправить стартовое сообщение: {e}")
 
     try:
         ensure_vnc_services()  # виртуальный экран нужен и для рабочего браузера
@@ -821,6 +888,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                             total_screens += 1
                             filepath = os.path.join(save_dir, f"screen_{total_screens}.jpg")
                             page.screenshot(path=filepath, type="jpeg", quality=85, full_page=False)
+                            request_git_push()
 
                             if total_screens % 5 == 0 or total_screens == target_screens:
                                 send_partial()  # сначала скрины (без подписи)
@@ -890,7 +958,8 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
             pass
         bot.send_message(chat_id, f"💥 Ошибка при выполнении: {str(e)[:180]}")
     finally:
-        active_workers.pop(user_id, None)
+        if active_workers.get(user_id) is state_ctrl:
+            active_workers.pop(user_id, None)
 
 
 # ==========================================
@@ -976,8 +1045,8 @@ def handle_callbacks(call):
         if not os.path.exists(paths["faq"]):
             bot.answer_callback_query(call.id, "Сначала задай ТЗ!", show_alert=True)
             return
-        if user_id in active_workers:
-            bot.answer_callback_query(call.id, "У тебя уже запущено задание!", show_alert=True)
+        if get_active(user_id):
+            already_running(chat_id, call)
             return
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -995,11 +1064,24 @@ def handle_callbacks(call):
 
     elif data.startswith("start_task:"):
         _, acc_id, delivery_mode = data.split(":", 2)
-        if user_id in active_workers:
-            bot.answer_callback_query(call.id, "У тебя уже запущено задание!", show_alert=True)
+        if get_active(user_id):
+            already_running(chat_id, call)
             return
         bot.answer_callback_query(call.id, "Запускаю задание...")
         threading.Thread(target=task_worker, args=(user_id, chat_id, acc_id, delivery_mode), daemon=True).start()
+
+    elif data == "force_stop":
+        worker = get_active(user_id)
+        if worker:
+            worker["stop"] = True
+            worker["extra_count"] = 0
+            worker["pause"].set()
+            worker["extra_event"].set()
+            bot.answer_callback_query(call.id, "Останавливаю...")
+            bot.send_message(chat_id, "🛑 Останавливаю задание. Скрины, что успел сделать, пришлю. Через ~20 сек можно запускать новое.")
+        else:
+            bot.answer_callback_query(call.id, "Активных заданий нет")
+            bot.send_message(chat_id, "✅ Активных заданий нет, можно запускать новое.", reply_markup=main_menu_kb())
 
     elif data == "task_extra":
         user_states[user_id] = "wait_extra"
@@ -1130,5 +1212,7 @@ if __name__ == "__main__":
         ensure_vnc_services()
     except Exception as e:
         print(f"[!] Не удалось заранее поднять VNC: {e}")
+    if GIT_ENABLED:
+        threading.Thread(target=git_push_loop, daemon=True).start()
     print("[🤖] Telegram-бот запущен и готов к работе...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
