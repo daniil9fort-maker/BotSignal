@@ -41,6 +41,29 @@ VNC_DISPLAY = ":99"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+
+def md_escape(text):
+    """Экранирует спецсимволы Markdown (_ * ` [) в динамическом тексте."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
+
+def _with_markdown_fallback(method):
+    """Если Telegram не смог разобрать разметку — шлём то же сообщение без неё, а не падаем."""
+    def wrapper(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except Exception as e:
+            if kwargs.get("parse_mode") and "parse entities" in str(e):
+                kwargs = dict(kwargs)
+                kwargs.pop("parse_mode", None)
+                return method(*args, **kwargs)
+            raise
+    return wrapper
+
+
+bot.send_message = _with_markdown_fallback(bot.send_message)
+bot.edit_message_text = _with_markdown_fallback(bot.edit_message_text)
+
 user_states = {}       # user_id -> "wait_faq" | "wait_extra" | None
 active_workers = {}    # user_id -> {"stop": bool, "extra_event": Event, "extra_count": int}
 login_locks = threading.Lock()
@@ -468,7 +491,7 @@ def login_session_worker(user_id, chat_id):
                 context.close()
                 bot.send_message(
                     chat_id,
-                    f"✅ Аккаунт **{username}** успешно добавлен!",
+                    f"✅ Аккаунт **{md_escape(username)}** успешно добавлен!",
                     parse_mode="Markdown",
                     reply_markup=accounts_menu_kb(user_id),
                 )
@@ -710,10 +733,10 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
     mode_label = "🖼 Пачкой фото в чат" if delivery_mode == "photos" else "📦 ZIP-архивом"
     bot.send_message(
         chat_id,
-        f"🚀 Запустил задание **{task_name}** на аккаунте **{username}**\n"
+        f"🚀 Запустил задание **{md_escape(task_name)}** на аккаунте **{md_escape(username)}**\n"
         f"• Цель: {target_screens} скринов (макс {max_per_video}/ролик)\n"
         f"• Выдача: {mode_label}\n"
-        f"• Текст: `{base_comment}`",
+        f"• Текст: `{str(base_comment).replace(chr(96), chr(39))}`",
         parse_mode="Markdown",
         reply_markup=bottom_kb(),
     )
@@ -833,7 +856,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                 )
                 bot.send_message(
                     chat_id,
-                    f"🏁 Задание **{task_name}** выполнено ({total_screens} скринов)!\nНужно ли доделать штрафные скриншоты?",
+                    f"🏁 Задание **{md_escape(task_name)}** выполнено ({total_screens} скринов)!\nНужно ли доделать штрафные скриншоты?",
                     parse_mode="Markdown",
                     reply_markup=kb,
                 )
@@ -908,7 +931,7 @@ def handle_callbacks(call):
             types.InlineKeyboardButton("🗑 Удалить аккаунт", callback_data=f"del_acc:{acc_id}"),
             types.InlineKeyboardButton("🔙 К списку аккаунтов", callback_data="menu_accounts"),
         )
-        bot.edit_message_text(f"👤 Аккаунт: **{info['username']}**", chat_id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+        bot.edit_message_text(f"👤 Аккаунт: **{md_escape(info['username'])}**", chat_id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
 
     elif data.startswith("del_acc:"):
         acc_id = data.split(":", 1)[1]
