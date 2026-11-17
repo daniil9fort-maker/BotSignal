@@ -679,6 +679,34 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
     state_ctrl["pause"].set()  # set = работает, clear = пауза
     active_workers[user_id] = state_ctrl
 
+    def send_partial():
+        """Сразу шлёт в чат ещё не отправленные скрины альбомами (только режим «фото»)."""
+        nonlocal last_sent_idx
+        if delivery_mode != "photos" or total_screens < last_sent_idx:
+            return
+        files = [
+            f for f in os.listdir(save_dir)
+            if f.endswith(".jpg") and last_sent_idx <= int(re.search(r"(\d+)", f).group(1)) <= total_screens
+        ]
+        files.sort(key=lambda x: int(re.search(r"(\d+)", x).group(1)))
+        for i in range(0, len(files), 10):
+            chunk = files[i:i + 10]
+
+            def _send_album(chunk=chunk):
+                handles = [open(os.path.join(save_dir, fn), "rb") for fn in chunk]
+                try:
+                    bot.send_media_group(chat_id, [types.InputMediaPhoto(h) for h in handles], timeout=180)
+                finally:
+                    for h in handles:
+                        h.close()
+
+            try:
+                with_retries(_send_album, attempts=3)
+                last_sent_idx = int(re.search(r"(\d+)", chunk[-1]).group(1)) + 1
+            except Exception as e:
+                print(f"[!] Не удалось отправить пачку скринов: {e}")
+                return  # остальное уйдёт в конце задания
+
     mode_label = "🖼 Пачкой фото в чат" if delivery_mode == "photos" else "📦 ZIP-архивом"
     bot.send_message(
         chat_id,
@@ -772,6 +800,7 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
                             page.screenshot(path=filepath, type="jpeg", quality=85, full_page=False)
 
                             if total_screens % 5 == 0 or total_screens == target_screens:
+                                send_partial()  # сначала скрины (без подписи)
                                 bot.send_message(chat_id, f"✅ Сделано скриншотов: {total_screens}/{target_screens}")
 
                         if total_screens >= target_screens:
@@ -830,6 +859,12 @@ def task_worker(user_id, chat_id, acc_id, delivery_mode):
 
             context.close()
     except Exception as e:
+        # сначала отправляем уже сделанные скрины, потом текст ошибки
+        try:
+            if total_screens >= last_sent_idx:
+                send_screens_result(chat_id, save_dir, task_name, delivery_mode, start_from_idx=last_sent_idx)
+        except Exception:
+            pass
         bot.send_message(chat_id, f"💥 Ошибка при выполнении: {str(e)[:180]}")
     finally:
         active_workers.pop(user_id, None)
